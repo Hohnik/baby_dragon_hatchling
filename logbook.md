@@ -168,3 +168,32 @@ designed for tasks that require planning and backtracking, not next-character pr
 1. Adding per-layer params to the standard BDH is the simplest, highest-impact change
 2. The BDH-HRM architecture is ready for future reasoning task experiments
 3. The no-grad trick is valuable for memory efficiency regardless
+
+---
+
+## Entry 6 — Final Comprehensive Results (2026-02-17 00:15)
+
+**Final benchmark (30 steps, B=4, T=256, fp16 autocast):**
+
+| Model | Params | Val Loss | ms/step | tok/s |
+|---|---|---|---|---|
+| Original BDH (6 shared, no opt) | 25M | OOM / ~60s | — | — |
+| BDH + all optimizations | **50M** | **2.60** | 1116 | 918 |
+| BDH-HRM (1H×2L) | 50M | 2.67 | **920** | **1113** |
+
+**Total improvement stack (cumulative):**
+
+1. **Gradient checkpointing** → trainable on 8GB (was OOM)
+2. **RoPE cache** → -1.3ms per forward
+3. **Score normalization (1/√N)** → enables fp16, training stability
+4. **fp16 autocast** → 14% faster, 2x larger batch possible
+5. **Per-layer parameters** → val loss 3.39 → 2.60 (biggest quality win)
+6. **2 layers optimal** → same quality as 3+, faster
+7. **LR schedule + gradient clipping** → standard best practices
+8. **BDH-HRM hybrid** → 21% faster throughput via no-grad trick, useful for future reasoning tasks
+
+**From original to final: ~60s/step → 1.1s/step (55x faster), val 3.39 → 2.60 (-0.79)**
+
+The BDH-HRM architecture is preserved in `src/bdh_hrm.py` for future experiments on
+reasoning tasks where the hierarchical multi-timescale structure is expected to matter
+more than for character-level language modeling.
