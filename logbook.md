@@ -28,11 +28,16 @@ Standard transformers scale by 1/√d_k (Vaswani et al. 2017).
 2. Improve training stability and convergence
 3. Follow theoretical attention scaling
 
-**Results:** [to be filled after implementation]
+**Results:**
+- 1/√N scaling brings init scores from ~87-160 down to ~0.96 (unit variance)
+- **fp16 now works** — 10 training steps with zero NaN
+- 14% speedup from fp16: 3515ms → 3095ms per step
+- fp16 also doubles max batch: B=8 → B=20 fits in 8GB M1
+- Loss curves match f32 closely (5.59→4.90 vs 5.59→4.91 in 10 steps)
 
 ---
 
-## Entry 3 — HRM + BDH Hybrid Architecture (2026-02-16 23:00)
+## Entry 3 — BDH-HRM Hybrid Architecture (2026-02-16 23:00)
 
 **Goal:** Combine BDH's biologically-inspired sparse attention with HRM's hierarchical
 multi-timescale reasoning.
@@ -54,12 +59,27 @@ multi-timescale reasoning.
   plasticity mechanism for the refinement loop
 
 **Design:**
-- H-level: BDH layer operating on slow/abstract state
-- L-level: BDH layer operating on fast/detailed state
+- H-level: BDH block (separate encoder/decoder params)
+- L-level: BDH block (separate encoder/decoder params)
+- Shared attention (RoPE is position-based)
 - L receives (z_H + input_embeddings) as input injection
 - H receives z_L as input injection
-- H_cycles=3, L_cycles=2 inner iterations (configurable)
-- No-grad trick: only final iteration has gradients
-- Ponder loss to regularize computation depth
+- h_cycles=3, l_cycles=2 (total 6 iterations = same as original 6 layers)
+- No-grad trick: only final L+H iteration has gradients
 
-**Results:** [to be filled after implementation]
+**Results (50 training steps, B=4, T=256):**
+
+| Model | Params | Val Loss | ms/step | tok/s | Total Time |
+|---|---|---|---|---|---|
+| BDH (6 shared layers) | 25.3M | **3.77** | 3126 | 328 | 156s |
+| BDH-HRM (3H×2L) | 50.5M | 3.89 | **1600** | **640** | **80s** |
+
+**Key findings:**
+1. **BDH-HRM is 2x faster per step** thanks to the no-grad trick (only 1 iteration has
+   gradients instead of 6). This is the biggest win.
+2. **BDH-HRM trains loss faster**: at step 25, BDH-HRM=3.12 vs BDH=3.34 (train loss)
+3. **Val loss slightly worse** after 50 steps (3.89 vs 3.77) — likely needs more steps for
+   the hierarchical structure to learn H vs L roles, and has 2x more params to fit
+4. **2x more parameters** (50M vs 25M) because H and L have separate encoder/decoder
+5. In **wall-clock time**, BDH-HRM trains 50 steps in 80s vs BDH needs 156s — clearly
+   more efficient
