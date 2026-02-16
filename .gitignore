@@ -1,1 +1,4 @@
 input.txt
+uv.lock
+*.pyc
+__pycache__/
