@@ -219,8 +219,9 @@ class BDHHRM(nn.Module):
         input_emb = self.ln(input_emb)
 
         # Initialize H and L states (broadcast learned init to batch)
-        z_H = self.h_init.view(1, 1, 1, D).expand(B, 1, T, D).clone()
-        z_L = self.l_init.view(1, 1, 1, D).expand(B, 1, T, D).clone()
+        # Detach to ensure no_grad block works correctly for all cycle configs
+        z_H = self.h_init.view(1, 1, 1, D).expand(B, 1, T, D).clone().detach()
+        z_L = self.l_init.view(1, 1, 1, D).expand(B, 1, T, D).clone().detach()
 
         # ─── HRM-style iterative refinement ───
         # All iterations except the last run in no_grad (HRM's key memory trick).

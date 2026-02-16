@@ -83,3 +83,59 @@ multi-timescale reasoning.
 4. **2x more parameters** (50M vs 25M) because H and L have separate encoder/decoder
 5. In **wall-clock time**, BDH-HRM trains 50 steps in 80s vs BDH needs 156s — clearly
    more efficient
+
+**Cycle configuration sweep (30 steps each):**
+
+| Config | Val Loss | ms/step | tok/s | Notes |
+|---|---|---|---|---|
+| BDH (6 shared layers) | 3.39 | 3126 | 328 | baseline |
+| HRM 3H×2L | 3.09 | 1599 | 640 | default HRM config |
+| HRM 2H×3L | 3.07 | 1478 | 693 | slightly better |
+| HRM 6H×1L | 3.13 | 1976 | 518 | all abstract, slower |
+| **HRM 1H×6L** | **2.74** | **1425** | **718** | **best by far!** |
+| HRM 4H×3L (deep) | 3.14 | 2483 | 412 | more iterations but slower |
+
+**Key insight: 1H×6L dominates.** Only 1 abstract H-cycle with 6 detailed L-cycles
+gives both the best val loss AND the highest throughput. This aligns with the ARC Prize
+team's finding: "HRM's gains came largely from its outer-loop refinement process" — in
+our case, the L-level's iterative refinement of details is doing the heavy lifting, not
+the H-level abstraction.
+
+This makes biological sense: BDH's Hebbian gating (x_sparse * y_sparse) acts as a
+plasticity mechanism that refines representations iteratively. More L-cycles = more
+refinement passes through this gating mechanism.
+
+---
+
+## Entry 4 — Optimizing L-cycle Count (2026-02-16 23:30)
+
+**Goal:** Now that 1H×?L dominates, find the optimal L-cycle count.
+
+**L-cycle scaling sweep (30 steps each, B=4, T=256):**
+
+| Config | Val Loss | ms/step | tok/s |
+|---|---|---|---|
+| BDH baseline | 3.39 | 3125 | 328 |
+| **1H×1L (1 iter)** | 2.76 | **868** | **1180** |
+| **1H×2L (2 iters)** | **2.68** | 920 | 1113 |
+| 1H×3L (3 iters) | 2.70 | 1047 | 978 |
+| 1H×4L (4 iters) | 2.71 | 1171 | 875 |
+| 1H×6L (6 iters) | 2.74 | 1424 | 719 |
+
+**Key insight: diminishing returns beyond 2 no-grad L iterations.** With the no-grad trick,
+gradients only flow through the final L+H step. Additional no-grad iterations "warm up" the
+hidden state but don't improve the gradient signal. For this character-level task, 1-2
+warmup iterations are optimal.
+
+**Best config: 1H×2L** — best val loss (2.68) at 3.4x faster than BDH baseline.
+
+The 1H×1L config (no warmup) is also excellent: essentially just two separate BDH blocks
+(H and L) with a single gradient pass. This is 3.6x faster than baseline and still far
+better val loss (2.76 vs 3.39).
+
+**What's really happening:** The gain isn't from more iterations. It's from having
+**separate H and L parameters** instead of shared layers. The BDH baseline uses the same
+encoder/decoder for all 6 layers. BDH-HRM gives each level its own parameters (50M vs 25M).
+This supports improvement item I from improvements.md (per-layer parameters).
+
+Created `src/train_hrm.py` with the optimal 1H×2L configuration.
