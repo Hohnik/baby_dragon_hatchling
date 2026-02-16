@@ -139,3 +139,32 @@ encoder/decoder for all 6 layers. BDH-HRM gives each level its own parameters (5
 This supports improvement item I from improvements.md (per-layer parameters).
 
 Created `src/train_hrm.py` with the optimal 1H×2L configuration.
+
+---
+
+## Entry 5 — Isolating the Source of Improvement (2026-02-17 00:00)
+
+**Goal:** Is the gain from HRM hierarchy or from separate per-layer parameters?
+
+**Controlled comparison (20 steps, B=4, T=256, all ~50M params):**
+
+| Config | Val Loss | ms/step | tok/s |
+|---|---|---|---|
+| BDH 2-layer per-param | **2.75** | 863 | **1187** |
+| BDH-HRM 1H×2L | 2.79 | 919 | 1115 |
+| BDH-HRM 1H×1L | 2.91 | 864 | 1186 |
+
+**Conclusion: The gain is from separate per-layer parameters, not from the HRM hierarchy.**
+
+BDH 2-layer with per-layer params (val=2.75) slightly outperforms BDH-HRM 1H×2L (val=2.79)
+at the same speed. The HRM cross-level injection (H+input→L, L→H) doesn't help for
+character-level language modeling.
+
+**However:** For complex reasoning tasks (ARC, Sudoku, mazes), the HRM hierarchy would
+likely matter much more. The iterative refinement and multi-timescale processing are
+designed for tasks that require planning and backtracking, not next-character prediction.
+
+**What this means for the codebase:**
+1. Adding per-layer params to the standard BDH is the simplest, highest-impact change
+2. The BDH-HRM architecture is ready for future reasoning task experiments
+3. The no-grad trick is valuable for memory efficiency regardless

@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclasses.dataclass
 class BDHConfig:
-    n_layer: int = 6
+    n_layer: int = 2  # per-layer params: 2 layers found optimal (see logbook.md entry 5)
     n_embd: int = 256
     dropout: float = 0.1
     n_head: int = 4
@@ -122,30 +122,30 @@ class BDH(nn.Module):
         D = config.n_embd
         N = config.mlp_internal_dim_multiplier * D // nh
 
-        self.decoder = nn.Parameter(torch.zeros((nh * N, D)).normal_(std=0.02))
-        self.encoder = nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02))
-
         self.attn = Attention(config)
-
         self.ln = nn.LayerNorm(D, elementwise_affine=False, bias=False)
         self.embed = nn.Embedding(config.vocab_size, D)
         self.drop = nn.Dropout(config.dropout)
-        self.encoder_v = nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02))
 
         self.lm_head = nn.Parameter(
             torch.zeros((D, config.vocab_size)).normal_(std=0.02)
         )
 
-        # Wrap each layer for gradient checkpointing
-        self.layer = BDHLayer(
-            self.attn,
-            self.ln,
-            self.drop,
-            self.encoder,
-            self.encoder_v,
-            self.decoder,
-            config,
-        )
+        # Per-layer parameters: each layer gets its own encoder/decoder.
+        # This was the single highest-impact improvement found in our experiments:
+        # val loss 2.75 (per-layer) vs 3.39 (shared) — a 0.64 improvement.
+        # The original shared-weight design limits expressiveness: every layer
+        # applies the same transformation. Per-layer params let early layers
+        # learn local patterns (character n-grams) and later layers learn
+        # compositional/semantic patterns.
+        self.layers = nn.ModuleList([
+            BDHLayer(self.attn, self.ln, self.drop,
+                     encoder=nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02)),
+                     encoder_v=nn.Parameter(torch.zeros((nh, D, N)).normal_(std=0.02)),
+                     decoder=nn.Parameter(torch.zeros((nh * N, D)).normal_(std=0.02)),
+                     config=config)
+            for _ in range(config.n_layer)
+        ])
 
         self.apply(self._init_weights)
 
@@ -167,13 +167,9 @@ class BDH(nn.Module):
 
         for level in range(C.n_layer):
             if self.use_grad_checkpoint and self.training:
-                # Gradient checkpointing: trade compute for memory.
-                # Instead of storing all intermediates for backward (6 layers of
-                # (B,nh,T,N=8192) tensors), recompute them during backward.
-                # Saves ~60% peak memory at cost of ~30% more compute.
-                x = checkpoint(self.layer, x, use_reentrant=False)
+                x = checkpoint(self.layers[level], x, use_reentrant=False)
             else:
-                x = self.layer(x)
+                x = self.layers[level](x)
 
         logits = x.view(B, T, D) @ self.lm_head
         loss = None
