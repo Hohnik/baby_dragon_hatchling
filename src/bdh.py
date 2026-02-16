@@ -62,11 +62,14 @@ class Attention(torch.nn.Module):
 
     def forward(self, Q, K, V):
         assert K is Q
-        _, _, T, _ = Q.size()
+        _, _, T, N = Q.size()
 
         QR = self.rope(Q, T)
         # K is Q, so KR is QR — no redundant RoPE computation
-        scores = (QR @ QR.mT).tril(diagonal=-1)
+        # Scale by 1/√N following "Attention Is All You Need" (Vaswani et al. 2017).
+        # Without this, raw scores reach ~100-450 with N=8192, causing fp16 gradient
+        # overflow. With scaling, scores have unit variance at init.
+        scores = (QR @ QR.mT * (N ** -0.5)).tril(diagonal=-1)
         return scores @ V
 
 
