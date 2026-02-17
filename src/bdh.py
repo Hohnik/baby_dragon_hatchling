@@ -51,6 +51,11 @@ class BDHConfig:
     # Requires n_head to be even. 4 heads → 2 differential groups.
     # Adds only n_head//2 learnable params but gives consistent quality wins.
     diff_attn: bool = True
+    # Local attention window. Restricts attention to the W most recent tokens
+    # instead of full causal attention. Reduces noise from irrelevant distant
+    # context, acting as regularization. 0 = full causal (no window).
+    # Recommended: 64 for character-level LM. Larger for word/subword models.
+    attn_window: int = 64
 
 
 def _get_freqs(n: int, theta: float, dtype: torch.dtype) -> torch.Tensor:
@@ -132,6 +137,9 @@ class Attention(nn.Module):
             # λ_init=0 → sigmoid(0)=0.5 → moderate subtraction at init
             self.lambda_param = nn.Parameter(torch.zeros(1, n_groups, 1, 1))
 
+        # Local attention window
+        self._attn_window = config.attn_window
+
     def rope(self, v: torch.Tensor, T: int, offset: int = 0) -> torch.Tensor:
         # Complex rotation: treat dim pairs as complex numbers, single multiply.
         # ~4x faster than element-wise rotation on N=2048 tensors.
@@ -165,6 +173,15 @@ class Attention(nn.Module):
 
         QR = self.rope(Q, T, offset=pos_offset)
 
+        # Build attention mask: causal + optional local window
+        if self._attn_window > 0 and self._attn_window < T:
+            # Local window: attend only to the W most recent tokens
+            mask = torch.ones(T, T, device=Q.device, dtype=Q.dtype)
+            mask = mask.tril(diagonal=-1)  # causal
+            mask = mask.triu(diagonal=-(self._attn_window - 1))  # window
+        else:
+            mask = None  # use .tril() directly (faster, no extra tensor)
+
         # Within-chunk attention (parallel, causal)
         if self._diff_attn:
             # Differential Attention: pair heads, compute difference.
@@ -174,8 +191,12 @@ class Attention(nn.Module):
             n_groups = nh // 2
             QR1 = QR[:, 0::2, :, :]  # even heads
             QR2 = QR[:, 1::2, :, :]  # odd heads
-            scores1 = (QR1 @ QR1.mT * self._scale).tril(diagonal=-1)
-            scores2 = (QR2 @ QR2.mT * self._scale).tril(diagonal=-1)
+            if mask is not None:
+                scores1 = (QR1 @ QR1.mT * self._scale) * mask
+                scores2 = (QR2 @ QR2.mT * self._scale) * mask
+            else:
+                scores1 = (QR1 @ QR1.mT * self._scale).tril(diagonal=-1)
+                scores2 = (QR2 @ QR2.mT * self._scale).tril(diagonal=-1)
             lam = torch.sigmoid(self.lambda_param)
             diff_scores = scores1 - lam * scores2  # (B, n_groups, T, T)
             # Expand V to groups and compute output
@@ -184,7 +205,10 @@ class Attention(nn.Module):
             # Broadcast back to full head count (both sub-heads share output)
             output = output_groups.repeat_interleave(2, dim=1)  # (B, nh, T, D)
         else:
-            scores = (QR @ QR.mT * self._scale).tril(diagonal=-1)
+            if mask is not None:
+                scores = (QR @ QR.mT * self._scale) * mask
+            else:
+                scores = (QR @ QR.mT * self._scale).tril(diagonal=-1)
             output = scores @ V  # (B, nh, T, D)
 
         # Compute forget gate based on mode.

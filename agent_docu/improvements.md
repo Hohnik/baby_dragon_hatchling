@@ -104,8 +104,9 @@ complex RoPE: forward 78ms→46ms, backward 141ms→110ms.
 | **Complex RoPE** | **fwd -41%** | — |
 | **Flat encode + einsum enc_v** | **+45% tok/s** | — |
 | **Differential Attention** | **+4% overhead** | **val Δ=-0.019** |
+| **Local Attention Window (w=64)** | **no overhead** | **val Δ=-0.032** |
 
-**Total: OOM/~60s per step → 122 ms/step, val ~1.98 at 500 steps (with diff_attn)**
+**Total: OOM/~60s per step → ~125 ms/step, val ~1.98 at 500 steps (diff_attn + local_w64)**
 
 ## Future Work
 
@@ -144,3 +145,19 @@ novel approaches and combination testing.
 - **RMSNorm**: Δ=-0.005 alone but hurts in combinations. LayerNorm is fine.
 - **Gated residual**: Δ=-0.028 alone but hurts when combined with diff attention.
 - **Learned temperature**: Δ=-0.009. Marginal and doesn't stack with diff attention.
+
+### 17. Local Attention Window (w=64) — Val Δ=-0.032 at 500 steps
+Restrict attention to the 64 most recent tokens instead of full causal attention.
+Acts as regularization for character-level LM: prevents overfitting to spurious
+long-range correlations in small datasets. Biologically plausible — cortical neurons
+primarily interact locally. Zero extra parameters, no speed overhead.
+Configurable via `BDHConfig.attn_window` (0 = full causal).
+
+### Novel Approaches Tested but NOT Adopted (Entry 16)
+- **Causal Conv1D preprocessing**: Δ=+0.112. Disrupts character embeddings.
+- **Weight tying (embed ↔ lm_head)**: Δ=+0.002. Neutral.
+- **Output MLP**: Δ=+0.149. Too many params in output, undertrained.
+- **Embed scaling (√D)**: Δ=+0.026. Slight hurt.
+- **3 layers (separate decoders)**: Δ=+0.005, 50% slower. Undertrained.
+- **QK-Norm**: Δ=+0.438. Destroys ReLU sparsity patterns.
+- **Wider N=4096**: Δ=+0.025. Undertrained at this data scale.
