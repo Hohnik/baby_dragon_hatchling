@@ -197,3 +197,47 @@ designed for tasks that require planning and backtracking, not next-character pr
 The BDH-HRM architecture is preserved in `src/bdh_hrm.py` for future experiments on
 reasoning tasks where the hierarchical multi-timescale structure is expected to matter
 more than for character-level language modeling.
+
+---
+
+## Entry 7 — Recurrent Synaptic State + Truncated BPTT (2026-02-17 01:00)
+
+**Goal:** Implement BDH's core continuous learning mechanism as described in the paper.
+
+**What the paper says (Eq. 8, Appendix B.3):**
+BDH is a state-space model with synaptic state ρ that accumulates over time via Hebbian
+learning: `ρ_{t,l} := ρ_{t-1,l} + v*_{t,l} · x_{t,l}^T · U`. The paper trains with
+"Truncated BPTT, carrying over the recurrent state of attention."
+
+**What our code was doing:** Recomputing attention from scratch each forward pass. No
+state carryover between sequences. The Hebbian gating existed but was not accumulating.
+
+**Implementation:**
+1. Attention now returns `(output, new_state)` where `state = Σ QR^T @ V * scale`
+   Shape: (B, n_head, N, D) = (4, 4, 8192, 256) — the paper's synaptic state ρ
+2. Cross-chunk attention: `output += QR @ state` adds contribution from previous chunks
+3. Position offset: chunks after the first get correct RoPE positions via `pos_offset`
+4. `generate()` now uses incremental state — O(T) per token instead of O(T²)
+5. Training rewritten with `SequentialStreamer` for TBPTT
+
+**Correctness verification:**
+- Full sequence vs token-by-token incremental: max error 1.73e-06 ✓
+- Full sequence vs 2-chunk: max error 1.49e-06 ✓
+- Full sequence vs 4-chunk: max error 1.49e-06 ✓
+
+**Benchmark (50 steps, B=4, T=256):**
+
+| Mode | Val Loss | ms/step | tok/s |
+|---|---|---|---|
+| Random sampling (stateless) | **2.54** | **1160** | **883** |
+| TBPTT (continuous learning) | 2.63 | 1224 | 837 |
+
+**Finding:** TBPTT is slightly worse in 50-step benchmarks because random sampling sees
+more diverse data. This matches expectations: the paper trains on 1.9B tokens with 2048-
+token chunks. On tiny Shakespeare (1M chars) with 256 chunks and 50 steps, TBPTT's
+sequential nature reduces diversity. With longer training, the continuous synaptic state
+should capture cross-chunk patterns that random sampling cannot.
+
+**The important thing:** the architecture now correctly implements the paper's intended
+continuous learning mechanism. Both modes are available — stateless for quick experiments,
+stateful for proper training runs.

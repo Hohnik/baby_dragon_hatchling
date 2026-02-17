@@ -1,18 +1,14 @@
 # Copyright Pathway Technology, Inc.
-# Optimized training script for Apple M1 (8GB).
+# Training script for BDH with Truncated BPTT (continuous learning).
 #
-# Changes from original:
-#   1. Gradient checkpointing: recompute activations to save ~60% peak memory
-#   2. Gradient accumulation: simulate larger effective batch from small micro-batches
-#   3. Cosine LR schedule with warmup (standard from GPT-2/nanoGPT research)
-#   4. Gradient clipping: stabilize training with deep 6-layer network
-#   5. Preloaded data: avoid per-batch memmap/numpy overhead
-#   6. Periodic validation: track overfitting
-#   7. No torch.compile: slower on MPS (no inductor Metal backend)
-#   8. fp16 autocast: enabled by attention score normalization (1/√N scaling).
-#      Previously, raw scores ~400 caused fp16 gradient overflow. Now safe.
-#      Gives ~14% speedup on M1 by halving memory bandwidth.
-#   9. Proper device detection: auto-select MPS/CUDA/CPU
+# This implements the paper's intended training procedure:
+#   "Truncated Backpropagation Through time, carrying over the recurrent state
+#    of attention and training on sequences of length 2048 characters at a time."
+#    — BDH paper, Appendix B.3
+#
+# The key difference from standard training: instead of sampling random chunks,
+# we process text sequentially, carrying the synaptic state ρ across chunks.
+# This lets the model learn continuous representations that span chunk boundaries.
 
 import math
 import os
@@ -23,7 +19,7 @@ import numpy as np
 import requests
 import torch
 
-# ─── Device setup ───────────────────────────────────────────────────────────────
+# ─── Device ─────────────────────────────────────────────────────────────────────
 if torch.cuda.is_available():
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -35,8 +31,6 @@ else:
 
 torch.manual_seed(1337)
 
-# Mixed precision: attention score normalization (1/√N) enables fp16 without NaN.
-# Gives ~14% speedup on M1 by halving memory bandwidth for activations.
 USE_AMP = device.type in ("cuda", "mps")
 AMP_DTYPE = torch.float16
 if device.type == "cuda" and torch.cuda.is_bf16_supported():
@@ -45,39 +39,27 @@ if device.type == "cuda" and torch.cuda.is_bf16_supported():
 print(f"Device: {device} | AMP: {USE_AMP} ({AMP_DTYPE})")
 
 # ─── Configuration ──────────────────────────────────────────────────────────────
-# Tuned for 8GB M1: B=4 T=256 fits in memory with gradient checkpointing.
-# Original (B=32 T=512) requires ~74GB for activations — impossible on 8GB.
-#
-# To increase effective batch size without more memory, raise GRAD_ACCUM_STEPS.
-# Each doubling of GRAD_ACCUM_STEPS doubles step time but also effective batch.
-BLOCK_SIZE = 256  # sequence length (original: 512)
-MICRO_BATCH = 4  # micro-batch per accumulation step (original: 32)
-GRAD_ACCUM_STEPS = 1  # gradient accumulation steps
-EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM_STEPS  # total samples per optimizer step
+BLOCK_SIZE = 256
+MICRO_BATCH = 4  # number of parallel streams for TBPTT
+GRAD_ACCUM_STEPS = 1
+EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM_STEPS
 
 MAX_ITERS = 3000
 LEARNING_RATE = 1e-3
-MIN_LR = 1e-4  # cosine schedule floor
-WARMUP_ITERS = 200  # linear warmup iterations
+MIN_LR = 1e-4
+WARMUP_ITERS = 200
 WEIGHT_DECAY = 0.1
-GRAD_CLIP = 1.0  # max gradient L2 norm
+GRAD_CLIP = 1.0
 LOG_FREQ = 50
-EVAL_FREQ = 500  # run validation every N steps
-EVAL_ITERS = 10  # batches to average for stable val loss estimate
+EVAL_FREQ = 500
+EVAL_ITERS = 10
 
 BDH_CONFIG = bdh.BDHConfig(max_seq_len=BLOCK_SIZE)
 
 input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
 
 
-# ─── LR schedule: linear warmup → cosine decay ─────────────────────────────────
-def get_lr(step):
-    """Cosine LR schedule with linear warmup.
-
-    Standard from GPT-2/3 training (Brown et al. 2020) and nanoGPT.
-    - Warmup: prevents early instability when gradients are noisy at init.
-    - Cosine decay: smooth annealing gives better final loss than step decay.
-    """
+def get_lr(step: int) -> float:
     if step < WARMUP_ITERS:
         return LEARNING_RATE * (step + 1) / WARMUP_ITERS
     if step >= MAX_ITERS:
@@ -86,21 +68,18 @@ def get_lr(step):
     return MIN_LR + 0.5 * (LEARNING_RATE - MIN_LR) * (1 + math.cos(math.pi * progress))
 
 
-# ─── Data loading ───────────────────────────────────────────────────────────────
-def fetch_data():
+# ─── Data ────────────────────────────────────────────────────────────────────────
+def fetch_data() -> None:
     if not os.path.exists(input_file_path):
         data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
         with open(input_file_path, "w") as f:
             f.write(requests.get(data_url).text)
 
 
-# Preload full dataset into memory once. The original code re-opens a numpy memmap
-# every single batch call, which adds ~1ms overhead per call and prevents the OS
-# from caching the file efficiently.
-_data_cache = {}
+_data_cache: dict[str, torch.Tensor] = {}
 
 
-def _get_data(split):
+def _get_data(split: str) -> torch.Tensor:
     if split not in _data_cache:
         raw = np.fromfile(input_file_path, dtype=np.uint8)
         pivot = int(0.9 * len(raw))
@@ -111,7 +90,59 @@ def _get_data(split):
     return _data_cache[split]
 
 
-def get_batch(split, batch_size=MICRO_BATCH):
+class SequentialStreamer:
+    """Provides sequential chunks for TBPTT training.
+
+    Instead of random sampling, maintains B parallel read cursors into the
+    training data, advancing sequentially. This is required for the recurrent
+    synaptic state to accumulate meaningful cross-chunk information.
+
+    When a cursor reaches the end, it wraps around with a fresh state.
+    """
+
+    def __init__(self, data: torch.Tensor, batch_size: int, block_size: int):
+        self.data = data
+        self.block_size = block_size
+        self.batch_size = batch_size
+        # Divide data into B equal segments, one per stream
+        seg_len = len(data) // batch_size
+        self.cursors = [i * seg_len for i in range(batch_size)]
+        self.seg_len = seg_len
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor, list[bool]]:
+        """Get next sequential chunk for each stream.
+
+        Returns:
+            x: (B, T) input tokens
+            y: (B, T) target tokens
+            resets: list[bool] — True if this stream wrapped around (state should reset)
+        """
+        xs, ys, resets = [], [], []
+        for i in range(self.batch_size):
+            start = self.cursors[i]
+            end = start + self.block_size + 1
+            if end > len(self.data):
+                # Wrap around
+                start = 0
+                end = self.block_size + 1
+                resets.append(True)
+            else:
+                resets.append(False)
+            chunk = self.data[start:end]
+            xs.append(chunk[:-1])
+            ys.append(chunk[1:])
+            self.cursors[i] = start + self.block_size
+        return (
+            torch.stack(xs).to(device),
+            torch.stack(ys).to(device),
+            resets,
+        )
+
+
+def get_random_batch(
+    split: str, batch_size: int = MICRO_BATCH,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random batch for evaluation (no state needed)."""
     data = _get_data(split)
     ix = torch.randint(len(data) - BLOCK_SIZE, (batch_size,))
     x = torch.stack([data[i : i + BLOCK_SIZE] for i in ix])
@@ -119,50 +150,64 @@ def get_batch(split, batch_size=MICRO_BATCH):
     return x.to(device), y.to(device)
 
 
-# ─── Validation ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def estimate_loss(model):
-    """Average loss over multiple batches for a stable estimate.
-
-    Single-batch loss is noisy. Averaging over EVAL_ITERS batches gives
-    reliable train/val comparison to detect overfitting.
-    """
+def estimate_loss(model: bdh.BDH) -> dict[str, float]:
     model.eval()
     losses = {}
     for split in ("train", "val"):
         total = 0.0
         for _ in range(EVAL_ITERS):
-            x, y = get_batch(split)
+            x, y = get_random_batch(split)
             with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP):
-                _, loss = model(x, y)
+                _, loss, _ = model(x, y)
             total += loss.item()
         losses[split] = total / EVAL_ITERS
     model.train()
     return losses
 
 
+def _detach_state(state: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Detach state from computation graph for truncated BPTT."""
+    return [s.detach() for s in state]
+
+
+def _reset_stream_state(
+    state: list[torch.Tensor], resets: list[bool],
+) -> list[torch.Tensor]:
+    """Zero out state for streams that wrapped around."""
+    if not any(resets):
+        return state
+    new_state = []
+    for s in state:
+        s_new = s.clone()
+        for i, should_reset in enumerate(resets):
+            if should_reset:
+                s_new[i] = 0.0
+        new_state.append(s_new)
+    return new_state
+
+
 # ─── Training ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     fetch_data()
 
-    # use_grad_checkpoint=True: recompute layer activations during backward instead
-    # of storing them. Saves ~60% peak memory (those (B,nh,T,8192) intermediates)
-    # at the cost of one extra forward pass per layer during backward.
-    # On M1 this is actually FASTER because less memory pressure = fewer GPU stalls.
     model = bdh.BDH(BDH_CONFIG, use_grad_checkpoint=True).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
     print(
-        f"Config: {MAX_ITERS} iters, micro_batch={MICRO_BATCH}, "
-        f"accum={GRAD_ACCUM_STEPS}, effective_batch={EFFECTIVE_BATCH}, "
-        f"seq_len={BLOCK_SIZE}"
+        f"Config: {MAX_ITERS} iters, batch={MICRO_BATCH}, "
+        f"accum={GRAD_ACCUM_STEPS}, seq_len={BLOCK_SIZE}, "
+        f"TBPTT=True"
     )
     print()
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
     )
+
+    streamer = SequentialStreamer(_get_data("train"), MICRO_BATCH, BLOCK_SIZE)
+    state: list[torch.Tensor] | None = None  # recurrent synaptic state
 
     model.train()
     loss_acc = 0.0
@@ -171,36 +216,39 @@ if __name__ == "__main__":
     t_log = t_start
 
     for step in range(MAX_ITERS):
-        # ── LR schedule ──
         lr = get_lr(step)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # ── Gradient accumulation ──
-        # Process GRAD_ACCUM_STEPS micro-batches, accumulate gradients, then step.
-        # Mathematically equivalent to a single large batch but fits in memory.
         optimizer.zero_grad()
         step_loss = 0.0
+
         for micro_step in range(GRAD_ACCUM_STEPS):
-            x, y = get_batch("train")
-            with torch.autocast(device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP):
-                _, loss = model(x, y)
+            x, y, resets = streamer.next_batch()
+
+            # Reset state for streams that wrapped around
+            if state is not None:
+                state = _reset_stream_state(state, resets)
+
+            with torch.autocast(
+                device_type=device.type, dtype=AMP_DTYPE, enabled=USE_AMP,
+            ):
+                _, loss, new_state = model(x, y, state=state)
+
             scaled_loss = loss / GRAD_ACCUM_STEPS
             scaled_loss.backward()
             step_loss += loss.item()
+
+            # Truncated BPTT: carry state but detach from graph
+            state = _detach_state(new_state)
+
         step_loss /= GRAD_ACCUM_STEPS
-
-        # ── Gradient clipping ──
-        # Prevents rare large gradients from destabilizing weights.
-        # Standard practice for transformers (Megatron-LM, PaLM, etc.)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-
         optimizer.step()
 
         loss_acc += step_loss
         loss_steps += 1
 
-        # ── Logging ──
         if step % LOG_FREQ == 0:
             if device.type == "mps":
                 torch.mps.synchronize()
@@ -224,25 +272,22 @@ if __name__ == "__main__":
             loss_acc = 0.0
             loss_steps = 0
 
-        # ── Periodic validation ──
         if step > 0 and step % EVAL_FREQ == 0:
             losses = estimate_loss(model)
             print(
                 f"  ── eval: train={losses['train']:.4f} val={losses['val']:.4f}"
             )
 
-    # ── Final evaluation ──
     losses = estimate_loss(model)
     print(f"\nFinal: train={losses['train']:.4f} val={losses['val']:.4f}")
 
-    # ── Generate sample ──
     print("\nGenerating sample...")
     model.eval()
     prompt = torch.tensor(
-        bytearray("To be or ", "utf-8"), dtype=torch.long, device=device
+        bytearray("To be or ", "utf-8"), dtype=torch.long, device=device,
     ).unsqueeze(0)
-    ret = model.generate(prompt, max_new_tokens=100, top_k=3)
-    ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
-        errors="backslashreplace"
+    ret = model.generate(prompt, max_new_tokens=200, top_k=5)
+    text = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
+        errors="backslashreplace",
     )
-    print(ret_decoded)
+    print(text)
