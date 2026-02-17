@@ -815,3 +815,96 @@ New config is better at every checkpoint. Gap narrows at longer training
    transformer literature (SwiGLU, RMSNorm, QK-norm, weight tying, etc.) don't
    help or actively hurt BDH. The architecture has its own internal logic that
    differs from standard transformers.
+
+
+## Entry 18 — Graph-Based BDH Implementation (2026-02-17)
+
+**Goal:** Implement the true graph-based BDH model from Section 2 of the paper,
+as opposed to the tensor-friendly BDH-GPU approximation we've been using.
+
+### Background
+
+The BDH paper describes TWO architectures:
+1. **BDH** (Section 2): A graph-based model where N neurons communicate through
+   sparse graphs with K neighbors. Synaptic state lives on graph edges. This is
+   the biologically-faithful version.
+2. **BDH-GPU** (Section 3): A tensor-friendly approximation where graphs are
+   replaced by low-rank dense matrices (D_x E, D_y E) and state is compressed
+   into ρ = Eσ ∈ R^{n×d}. This is what `bdh.py` implements.
+
+The paper states: "BDH-GPU is obtained from BDH by treating the communication
+of the n particles as proceeding through a mean-field ('radio network'), rather
+than a graph ('communication by wire')."
+
+### Implementation: `src/bdh_graph.py`
+
+**Architecture (Eq. 6, Table 1):**
+```
+σ_{t,l} := σ_{t-1,l} + y_{t,l-1} x_{t,l}^T ⊙ G_s
+x_{t,l} := [x_{t,l-1} + (G_x^e - G_x^i) y_{t,l-1}]^+
+y_{t,l} := [(G_y^e - G_y^i)(σ_{t-1,l} x_{t,l})]^+ ⊙ x_{t,l}
+```
+
+**Key components:**
+- **Power-law graph construction**: Neurons on a ring, P(connect) ∝ 1/distance^α.
+  With α=1.5: 86% local (<64 distance), 2% long-range (>N/4).
+- **Sparse graph propagation**: Uses `torch.sparse.mm` (14x faster than gather+sum).
+  Excitatory/inhibitory circuits with positive weights via `.abs()`.
+- **Synaptic attention via cumsum**: Avoids O(T²·N) attention matrix by decomposing
+  per-edge attention into cumulative sums:
+  ```
+  kv[t,j,k] = y_prev[t, nb[j,k]] · x[t,j] · w[j,k]
+  S[t,j,k] = cumsum(kv, dim=t) - kv[t]  (shifted causal)
+  A[t,j] = Σ_k x[t, nb[j,k]] · S[t,j,k] / √(N/h)
+  ```
+- **RoPE on K-dimensional attention**: Each neighbor slot gets a rotation frequency.
+- **Dense IO**: Token ↔ neuron mapping uses dense encoder (d→N) / decoder (N→d).
+- **Gradient checkpointing**: Per-layer to reduce memory.
+
+**Graph statistics (N=2048, K_s=16, α=1.5):**
+- Mean neighbor distance: 45, median: 7
+- 86.2% connections local (<64), 2.0% long-range (>N/4)
+- Matches paper's "high modularity with heavy-tailed degree distribution"
+
+### Performance Comparison (500 steps, B=4, T=128)
+
+| Model | Params | Val Loss | ms/step | tok/s |
+|-------|--------|----------|---------|-------|
+| BDH-GPU (baseline) | 1.6M | **1.925** | 27 | ~19K |
+| BDH-Graph (N=2048 K=16 L=2) | 1.6M | 2.755 | 577 | 888 |
+
+### Ablation Sweep (200 steps, val loss)
+
+| Config | Val Loss | ms/step | Notes |
+|--------|----------|---------|-------|
+| Baseline (α=1.5, RoPE, inhib) | **2.548** | 531 | Best quality |
+| No inhibitory circuits | 2.594 | 447 | 16% faster, -0.046 |
+| α=2.0 (more local) | 3.022 | 534 | Much worse: needs long-range |
+| No RoPE | 2.621 | 473 | Slightly worse |
+
+### Technical Challenges
+
+1. **Sparse matmul dtype**: `torch.sparse.mm` on MPS requires float32. Cannot use
+   AMP (fp16). This limits throughput but maintains numerical stability.
+2. **Memory from [B,T,N,K] intermediates**: The attention gather creates tensors of
+   shape [B,T,N,K]. At B=4, T=128, N=4096, K=16 this is 128MB per tensor in fp32.
+   Limits practical N to ~2048 with gradient checkpointing.
+3. **Graph construction**: Power-law sampling is sequential (per-neuron). Takes ~1s
+   for N=4096 at startup but only happens once.
+
+### Key Takeaway
+
+The graph-based BDH is faithful to the paper's Section 2 but significantly slower
+and lower quality than BDH-GPU at the same parameter count on current GPU hardware.
+This confirms the paper's rationale for BDH-GPU: "10² to 10⁵ times more cost- and
+time-effective to train on GPU."
+
+The graph model's advantages (explicit topology, edge-level state, biological
+plausibility) would become relevant on:
+- Neuromorphic hardware (Loihi, SpiNNaker)
+- Very large N where dense matmul becomes quadratic
+- Applications requiring interpretable neuron-level dynamics
+
+**Files created:**
+- `src/bdh_graph.py` — Graph-based BDH model
+- `src/train_graph.py` — Training script for graph model

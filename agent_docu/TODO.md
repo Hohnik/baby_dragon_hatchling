@@ -11,7 +11,12 @@ agent_docu/logbook.md for history, and src/bdh.py for current code.
 **Architecture:** BDH (Baby Dragon Hatchling) — a biologically-inspired language model
 using sparse ReLU encoding into N=2048 dimensions, Hebbian gating, and RoPE.
 
-**Code:** `src/bdh.py` (~340 lines), `src/train.py` (~350 lines), plus
+**Two implementations:**
+- `src/bdh.py` — **BDH-GPU** (tensor-friendly, dense matmul, compressed state ρ)
+- `src/bdh_graph.py` — **BDH-Graph** (true graph model, sparse K-neighbor, edge state σ)
+
+**Code:** `src/bdh.py` (~340 lines), `src/bdh_graph.py` (~450 lines),
+`src/train.py` (~350 lines), `src/train_graph.py` (~200 lines), plus
 `src/generate.py`, `src/benchmark.py`, `src/profile_ops.py`, `src/info.py`.
 Run via `just <recipe>` (see `justfile`).
 
@@ -153,9 +158,10 @@ stateful + forget gate code for future large-scale experiments.
 
 ## File Map
 ```
-src/bdh.py              — Main model (~320 lines). Attention + BDHLayer + BDH.
-                          Config: BDHConfig.forget_mode = "none" | "scalar" | "data"
+src/bdh.py              — BDH-GPU model (~320 lines). Dense matmul, compressed state.
+src/bdh_graph.py        — BDH-Graph model (~450 lines). Sparse graph, edge state.
 src/train.py            — Training with TBPTT + curriculum (~330 lines).
+src/train_graph.py      — Training script for graph model (~200 lines).
 src/muon.py             — Optional Muon optimizer (168 lines).
 src/bdh_hrm.py          — BDH-HRM hybrid for reasoning tasks (287 lines).
 src/train_hrm.py        — HRM training script (200 lines).
@@ -164,7 +170,8 @@ src/bench_forget_abc.py — A/B/C forget gate benchmark (all 3 modes).
 src/bench_ab.py         — Legacy A/B forget gate benchmark.
 src/bench_forget.py     — Quick 55-step forget gate test.
 src/check_grad.py       — Verify gradients flow through forget gate in TBPTT.
-src/checkpoints/        — Saved model checkpoints.
+src/checkpoints/        — Saved model checkpoints (BDH-GPU).
+src/checkpoints_graph/  — Saved model checkpoints (BDH-Graph).
 agent_docu/             — improvements.md, logbook.md, this TODO.md
 papers/                 — 15 PDFs + README.md with relevance analysis
 ```
