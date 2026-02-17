@@ -720,3 +720,98 @@ accumulation. Also test novel multi-scale attention windows.
 5. **Gradient accumulation works**: B=4 accum=2 ≈ B=8 in quality, slightly slower.
 
 **Changed default MICRO_BATCH = 8 in train.py.**
+
+---
+
+## Entry 18 — Full Training Run + Comprehensive Novel Approach Summary (2026-02-17 21:45)
+
+**Goal:** Full 3000-step training run with all improvements (diff_attn + local_w64 + B=8),
+plus documentation of all novel approaches tested.
+
+### 3000-Step Training Progress (new config vs old)
+
+| Step | Old Val Loss | New Val Loss | Δ |
+|---|---|---|---|
+| 500 | 1.9415 | **1.7697** | **-0.172** |
+| 1000 | 1.7827 | **1.6213** | **-0.161** |
+| 1500 | 1.6624 | **1.5443** | **-0.118** |
+| 2000 | 1.6027 | **1.5381** | **-0.065** |
+
+New config is better at every checkpoint. Gap narrows at longer training
+(improvements are most valuable in early/mid training).
+
+### All Novel Approaches Tested (4 rounds, 30+ experiments)
+
+**Round 1 — Architectural innovations (Entry 15):**
+- ✅ **Differential Attention**: Δ=-0.033 → adopted as default
+- ❌ SwiGLU encoding: Δ=+0.194
+- ❌ Top-K sparsification: Δ=+0.033, 60% slower
+- ❌ per_head_v: Δ=+0.027
+- ❌ RMSNorm: Δ=-0.005 alone, hurts in combos
+- ❌ Gated residual: Δ=-0.028 alone, doesn't stack
+- ❌ Learned temperature: Δ=-0.009, doesn't stack
+
+**Round 2 — Depth and width:**
+- ❌ 3 layers: Δ=+0.005, 50% slower
+- ❌ 4 layers: Δ=+0.036, 100% slower
+- ❌ N=4096: Δ=+0.025, undertrained
+- ❌ QK-Norm: Δ=+0.438 (destroys sparsity)
+- ❌ Stochastic depth: Δ=+0.006
+- ~Shared decoder 3L: Δ=-0.010, 44% slower (not worth it)
+
+**Round 3 — Structural changes (Entry 16):**
+- ✅ **Local attention window w=64**: Δ=-0.032 → adopted as default
+- ❌ Causal Conv1D: Δ=+0.112
+- ❌ Weight tying: Δ=+0.002 (neutral)
+- ❌ Output MLP: Δ=+0.149
+- ❌ Embed scaling: Δ=+0.026
+- ❌ Multi-scale windows: Δ=+0.026
+
+**Round 4 — Throughput optimization (Entry 17):**
+- ✅ **Batch size B=8**: Δ=-0.284 → adopted as default
+- ❌ T=512: Δ=-0.019 but slower, batch size matters more
+- ~Grad accumulation: Δ=-0.043, equivalent to larger batch
+
+**Round 5 — Creative approaches:**
+- ❌ Layer recycling: Δ=+0.003 (neutral)
+- ❌ Token drop: Δ=+0.062 (hurts char-level LM)
+- ❌ Hebbian max gating: Δ=+0.152 (product gating is essential!)
+- ❌ Hebbian additive gating: Δ=+0.189 (multiplicative is critical)
+- ❌ Multi-token prediction: Δ=+0.045 (too noisy for char-level)
+
+**Round 6 — Regularization:**
+- ❌ Label smoothing: Δ=+0.047
+- ❌ Higher dropout: Δ=+0.070
+- ❌ Zero dropout: Δ=-0.006 (neutral)
+- ~Lower LR 5e-4: Δ=-0.010 (marginal)
+
+**Round 7 — Normalization:**
+- ❌ Pre-norm only: Δ=+0.102
+- ❌ Pre+post norm: NaN (diverges!)
+- ❌ No attn LN: NaN (diverges!)
+- ❌ Xavier init: Δ=+0.010
+- ❌ Scaled init: Δ=+0.059
+
+### Key Insights
+
+1. **The multiplicative Hebbian gating is sacred.** Both max and additive alternatives
+   are much worse. The product x_sparse * y_sparse is the core of the architecture.
+
+2. **The 4× LayerNorm is critical.** Removing any normalization causes divergence.
+   BDH's sparse encoding produces outputs with highly variable scale.
+
+3. **Differential attention works by cancelling noise in sparse attention patterns.**
+   BDH's ReLU-sparse Q/K produce noisy score distributions. Differencing paired heads
+   cancels the common noise while amplifying the true signal.
+
+4. **Local attention is regularization.** For char-level LM on 1M chars, attending to
+   distant tokens adds noise. Window=64 (~2-3 words) is the sweet spot.
+
+5. **Batch size > all other hyperparams.** B=8 gave the single largest quality win
+   across all experiments. Larger batches provide more stable gradients through
+   the sparse ReLU activations.
+
+6. **BDH's architecture is remarkably robust.** Most "standard" improvements from
+   transformer literature (SwiGLU, RMSNorm, QK-norm, weight tying, etc.) don't
+   help or actively hurt BDH. The architecture has its own internal logic that
+   differs from standard transformers.

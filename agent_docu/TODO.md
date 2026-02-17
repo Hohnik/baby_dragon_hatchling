@@ -29,16 +29,18 @@ Run via `just <recipe>` (see `justfile`).
 
 ---
 
-## Task 1: Full Training Run with Optimized Config  ← START HERE
+## Task 1: Full Training Run with Optimized Config  ← IN PROGRESS
 
-**Priority: HIGHEST.** The optimized config (N=2048, complex RoPE, flat matmuls)
-is 5.4x faster. At 122ms/step, a 3000-step run takes ~6 minutes.
+**Priority: HIGHEST.** Running 3000-step training with all improvements:
+diff_attn=True, attn_window=64, B=8, N=2048, fp16.
 
-- [ ] Full 3000-step training (stateless, N=2048)
-- [ ] Compare val loss vs 1000-step run (val=1.74)
-- [ ] Save checkpoints every 500 steps
-- [ ] Generate text samples at each checkpoint
-- [ ] Measure overfitting gap (train vs val)
+Progress so far:
+- [x] Step 500: val=1.7697 (vs old 1.9415, Δ=-0.172)
+- [x] Step 1000: val=1.6213 (vs old 1.7827, Δ=-0.161)
+- [x] Step 1500: val=1.5443 (vs old 1.6624, Δ=-0.118)
+- [x] Step 2000: val=1.5381 (vs old 1.6027, Δ=-0.065)
+- [ ] Step 2500
+- [ ] Step 3000 — final eval + text samples
 
 ---
 
@@ -112,6 +114,14 @@ stateful + forget gate code for future large-scale experiments.
   - Differential Attention (DIFF Transformer): Δ=-0.019, now default
   - SwiGLU, Top-K, per_head_v, RMSNorm: tested and rejected
   - Gated residual, learned temp: marginal, don't stack
+- [x] **Local attention window** — w=64, Δ=-0.032 (Entry 16)
+- [x] **Batch size B=8** — fits in 8GB, Δ=-0.284 at 500 steps (Entry 17)
+- [x] **Comprehensive novel approach testing** — 30+ experiments across 7 rounds:
+  - Depth/width: 3-4 layers, N=4096, asymmetric, shared decoder
+  - Structural: conv1d, weight tying, output MLP, embed scaling
+  - Creative: layer recycling, token drop, Hebbian variants, multi-token pred
+  - Regularization: label smoothing, dropout sweep, LR sweep
+  - Normalization: pre-norm, pre+post, QK-norm, Xavier/scaled init
 - [x] Data-dependent forgetting gate — safety net for stateful mode (Entry 10)
 - [x] Scalar forgetting gate — limited, no head specialization (Entry 10)
 - [x] Gradient check: forget_proj gets TBPTT gradients ✓
