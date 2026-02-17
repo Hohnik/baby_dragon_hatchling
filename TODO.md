@@ -26,9 +26,11 @@ much cheaper and still provide useful gradient signal early on.
 Muon (MomentUm Orthogonalized by Newton-Schulz) converges 1.5-2x faster than AdamW
 for transformer-like projection matrices. BDH's large encoder/decoder params are a
 natural fit.
-- [ ] Implement Muon for projection matrices (encoder, decoder, encoder_v)
-- [ ] Keep AdamW for embeddings and LayerNorm (per modded-nanogpt recipe)
-- [ ] Benchmark convergence speed vs AdamW
+- [x] Implement Muon for projection matrices (encoder, decoder, encoder_v)
+- [x] Keep AdamW for embeddings and LayerNorm (per modded-nanogpt recipe)
+- [x] Benchmark convergence speed vs AdamW
+- Result: +0.01 val loss improvement, 18% slower per step on M1. Newton-Schulz
+  iterations are compute-heavy on small GPUs. Better on A100+. Kept as optional.
 
 ### 4. Data Pipeline
 Async data loading to overlap CPU batch preparation with GPU compute.

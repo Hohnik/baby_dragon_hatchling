@@ -241,3 +241,38 @@ should capture cross-chunk patterns that random sampling cannot.
 **The important thing:** the architecture now correctly implements the paper's intended
 continuous learning mechanism. Both modes are available — stateless for quick experiments,
 stateful for proper training runs.
+
+---
+
+## Entry 8 — Sequence Length Curriculum (2026-02-17 01:15)
+
+Ramp T from 64→256 during the 200-step warmup. T=64 is 2.65x faster per step than T=256.
+
+| Mode | Val Loss | Time (50 warmup steps) | ms/step |
+|---|---|---|---|
+| Fixed T=256 | 2.61 | 57.7s | 1154 |
+| Curriculum 64→256 | 2.63 | 32.8s | 656 |
+
+**1.76x faster warmup** with negligible quality impact.
+
+---
+
+## Entry 9 — Muon Optimizer (2026-02-17 01:30)
+
+**Goal:** Test Muon (Newton-Schulz orthogonalized momentum) on BDH's projection matrices.
+
+**Results (50 steps, B=4, T=256):**
+
+| Optimizer | Val Loss | ms/step | tok/s |
+|---|---|---|---|
+| AdamW (baseline) | 2.54 | 1167 | 877 |
+| Muon ns=3 lr=0.02 | 2.53 | 1375 | 745 |
+| Muon ns=5 lr=0.02 | **2.53** | 1504 | 681 |
+| Muon ns=3 lr=0.05 | **2.53** | 1361 | 752 |
+
+**Finding:** Muon gives +0.01 val loss improvement but costs 18-29% speed. The Newton-Schulz
+iterations (5 matrix multiplications per parameter per step) are compute-heavy. On M1 with
+limited compute bandwidth, the overhead outweighs the convergence benefit at 50 steps.
+
+**Recommendation:** Keep AdamW as default for M1. Muon implemented in `src/muon.py` as
+optional for users with more compute (A100/H100 where NS overhead is negligible).
