@@ -105,8 +105,9 @@ complex RoPE: forward 78ms→46ms, backward 141ms→110ms.
 | **Flat encode + einsum enc_v** | **+45% tok/s** | — |
 | **Differential Attention** | **+4% overhead** | **val Δ=-0.019** |
 | **Local Attention Window (w=64)** | **no overhead** | **val Δ=-0.032** |
+| **Batch Size B=8** | **2x slower/step** | **val Δ=-0.284** |
 
-**Total: OOM/~60s per step → ~125 ms/step, val ~1.98 at 500 steps (diff_attn + local_w64)**
+**Total: OOM/~60s per step → ~370 ms/step, val ~1.68 at 500 steps (all improvements)**
 
 ## Future Work
 

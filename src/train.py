@@ -43,7 +43,7 @@ print(f"Device: {device} | AMP: {USE_AMP} ({AMP_DTYPE})")
 # ─── Configuration ──────────────────────────────────────────────────────────────
 BLOCK_SIZE = 256
 BLOCK_SIZE_MIN = 64  # curriculum start (ramp from 64 → 256 during warmup)
-MICRO_BATCH = 4  # number of parallel streams for TBPTT
+MICRO_BATCH = 8  # number of parallel streams for TBPTT
 GRAD_ACCUM_STEPS = 1
 EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM_STEPS
 

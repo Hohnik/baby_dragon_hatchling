@@ -681,3 +681,42 @@ When T ≤ attn_window (e.g., during incremental generation), falls back to stan
 causal mask.
 
 **Cumulative improvement: val ~1.98 at 500 steps (diff_attn + local_w64).**
+
+---
+
+## Entry 17 — Batch Size + Sequence Length + Multi-Scale Windows (2026-02-17 21:30)
+
+**Goal:** Optimize data throughput — batch size, sequence length, and gradient
+accumulation. Also test novel multi-scale attention windows.
+
+**Results (200 steps, all configs with diff_attn + local_w64):**
+
+| Config | Val Loss | Δ vs B4 T256 | ms/step | tok/s | Total Tokens |
+|---|---|---|---|---|---|
+| **B=8 T=256** | **2.0432** | **-0.059** | **370** | **4832** | **358K** |
+| B=4 T=256 accum2 | 2.0598 | -0.043 | 392 | 4570 | 358K |
+| B=4 T=512 | 2.0837 | -0.019 | 410 | 4364 | 358K |
+| B=4 T=256 (baseline) | 2.1025 | — | 208 | 4303 | 179K |
+| Multiscale 16+64 | 2.1287 | +0.026 | 229 | 3914 | 179K |
+| B=2 T=512 | 2.1435 | +0.041 | 227 | 3937 | 179K |
+
+**500-step validation:**
+
+| Config | Val Loss | Time | tok/s | Total Tokens |
+|---|---|---|---|---|
+| B=4 T=256 | 1.963 | 111s | 4369 | 486K |
+| **B=8 T=256** | **1.679** | **241s** | **4028** | **972K** |
+
+**Key findings:**
+
+1. **B=8 fits in 8GB M1** with gradient checkpointing + fp16. Even B=12 fits!
+2. **B=8 is the biggest quality win**: val 1.963 → 1.679 (Δ=-0.284) at 500 steps.
+   Larger batches give more stable gradients for the sparse ReLU activations.
+3. **Batch size > sequence length**: B=8 T=256 beats B=4 T=512 at equal total tokens.
+   The gradient stability benefit of larger batches outweighs longer context for
+   character-level LM.
+4. **Multi-scale windows don't help**: Layer-specific windows (e.g., 32+128) are
+   worse than uniform w=64. The model benefits from consistent receptive fields.
+5. **Gradient accumulation works**: B=4 accum=2 ≈ B=8 in quality, slightly slower.
+
+**Changed default MICRO_BATCH = 8 in train.py.**
