@@ -19,7 +19,7 @@ state of attention and training on sequences of length 2048 characters at a time
 ### 2. Sequence Length Curriculum
 Start training at T=64, ramp to T=256. Attention is O(T²), so short sequences are
 much cheaper and still provide useful gradient signal early on.
-- [ ] Schedule T as a function of training step
+- [x] Schedule T as a function of training step
 - [ ] Benchmark early training speed improvement
 
 ### 3. Muon Optimizer
