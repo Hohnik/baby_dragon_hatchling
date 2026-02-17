@@ -1,4 +1,14 @@
-input.txt
-uv.lock
+# Data
+src/input.txt
+
+# Checkpoints (large, regenerate with `just train`)
+src/checkpoints/
+
+# Python
 *.pyc
 __pycache__/
+.venv/
+
+# Build/cache
+.ruff_cache/
+uv.lock

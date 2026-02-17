@@ -15,9 +15,11 @@ import os
 import time
 
 import bdh
+import dataclasses
 import numpy as np
 import requests
 import torch
+from tqdm import tqdm
 
 # ─── Device ─────────────────────────────────────────────────────────────────────
 if torch.cuda.is_available():
@@ -54,8 +56,10 @@ GRAD_CLIP = 1.0
 LOG_FREQ = 50
 EVAL_FREQ = 500
 EVAL_ITERS = 10
+CKPT_FREQ = 500  # Save checkpoint every N steps
+CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 
-BDH_CONFIG = bdh.BDHConfig(max_seq_len=BLOCK_SIZE)
+BDH_CONFIG = bdh.BDHConfig(max_seq_len=BLOCK_SIZE + 320)  # extra room for generation
 
 input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
 
@@ -184,25 +188,60 @@ def estimate_loss(model: bdh.BDH) -> dict[str, float]:
     return losses
 
 
-def _detach_state(state: list[torch.Tensor]) -> list[torch.Tensor]:
+def _detach_state(state: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
     """Detach state from computation graph for truncated BPTT."""
-    return [s.detach() for s in state]
+    return [s.detach() if s is not None else None for s in state]
 
 
 def _reset_stream_state(
-    state: list[torch.Tensor], resets: list[bool],
-) -> list[torch.Tensor]:
+    state: list[torch.Tensor | None], resets: list[bool],
+) -> list[torch.Tensor | None]:
     """Zero out state for streams that wrapped around."""
     if not any(resets):
         return state
     new_state = []
     for s in state:
+        if s is None:
+            new_state.append(None)
+            continue
         s_new = s.clone()
         for i, should_reset in enumerate(resets):
             if should_reset:
                 s_new[i] = 0.0
         new_state.append(s_new)
     return new_state
+
+
+def save_checkpoint(
+    model: bdh.BDH, optimizer: torch.optim.Optimizer,
+    step: int, val_loss: float,
+) -> str:
+    """Save model + optimizer state to disk."""
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"bdh_step{step:05d}_val{val_loss:.4f}.pt")
+    torch.save({
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": val_loss,
+        "config": dataclasses.asdict(model.config),
+    }, path)
+    return path
+
+
+@torch.no_grad()
+def generate_sample(model: bdh.BDH, prompt: str = "KING RICHARD III:\n") -> str:
+    """Generate a text sample from the model."""
+    model.eval()
+    idx = torch.tensor(
+        bytearray(prompt, "utf-8"), dtype=torch.long, device=device,
+    ).unsqueeze(0)
+    ret = model.generate(idx, max_new_tokens=300, top_k=10, temperature=0.8)
+    text = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
+        errors="backslashreplace",
+    )
+    model.train()
+    return text
 
 
 # ─── Training ───────────────────────────────────────────────────────────────────
@@ -228,13 +267,13 @@ if __name__ == "__main__":
     state: list[torch.Tensor] | None = None  # recurrent synaptic state
 
     model.train()
-    loss_acc = 0.0
-    loss_steps = 0
     tok_acc = 0
-    t_start = time.perf_counter()
-    t_log = t_start
+    t_tok = time.perf_counter()
 
-    for step in range(MAX_ITERS):
+    pbar = tqdm(range(MAX_ITERS), desc="training", unit="step",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
+
+    for step in pbar:
         lr = get_lr(step)
         block_size = get_block_size(step)
         for pg in optimizer.param_groups:
@@ -267,39 +306,34 @@ if __name__ == "__main__":
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
 
-        loss_acc += step_loss
-        loss_steps += 1
         tok_acc += block_size * EFFECTIVE_BATCH
+        now = time.perf_counter()
+        dt = now - t_tok
+        tok_s = tok_acc / dt if dt > 0 else 0
 
-        if step % LOG_FREQ == 0:
-            if device.type == "mps":
-                torch.mps.synchronize()
-            now = time.perf_counter()
-            dt = now - t_log
-            t_log = now
-            tokens_per_sec = tok_acc / dt if step > 0 else 0
-            avg_loss = loss_acc / loss_steps
-            elapsed = now - t_start
-            eta = (MAX_ITERS - step) / max(step, 1) * elapsed
-            print(
-                f"step {step:>5}/{MAX_ITERS} | "
-                f"loss {avg_loss:.4f} | "
-                f"lr {lr:.2e} | "
-                f"T={block_size:>3} | "
-                f"{tokens_per_sec:,.0f} tok/s | "
-                f"elapsed {elapsed/60:.1f}m | "
-                f"eta {eta/60:.1f}m"
-            )
-            loss_acc = 0.0
-            loss_steps = 0
+        pbar.set_postfix_str(
+            f"loss={step_loss:.4f} lr={lr:.1e} T={block_size} {tok_s:,.0f}tok/s",
+            refresh=False,
+        )
+
+        if step > 0 and step % LOG_FREQ == 0:
             tok_acc = 0
+            t_tok = now
 
         if step > 0 and step % EVAL_FREQ == 0:
             losses = estimate_loss(model)
-            print(
-                f"  ── eval: train={losses['train']:.4f} val={losses['val']:.4f}"
+            tqdm.write(
+                f"  ── eval @ {step}: train={losses['train']:.4f} val={losses['val']:.4f}"
             )
 
+        if step > 0 and step % CKPT_FREQ == 0:
+            ckpt_losses = estimate_loss(model)
+            path = save_checkpoint(model, optimizer, step, ckpt_losses["val"])
+            tqdm.write(f"  ── checkpoint saved: {path}")
+            sample = generate_sample(model)
+            tqdm.write(f"  ── sample: {sample[:200]}…")
+
+    pbar.close()
     losses = estimate_loss(model)
     print(f"\nFinal: train={losses['train']:.4f} val={losses['val']:.4f}")
 
